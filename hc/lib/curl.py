@@ -12,6 +12,7 @@ from urllib.parse import urlencode
 import pycurl
 from django.conf import settings
 
+from hc.lib.tracing import inject_trace_context, start_span
 from hc.lib.typealias import JSONValue
 
 CurlSockAddr = tuple[int, int, int, tuple[str, int]]
@@ -158,6 +159,10 @@ def request(
     if "User-Agent" not in headers:
         headers["User-Agent"] = "healthchecks.io"
 
+    # Propagate the current trace context to the downstream service
+    # using the W3C Trace Context ("traceparent") header:
+    inject_trace_context(headers)
+
     headers_list = [_makeheader(k, v) for k, v in headers.items()]
     c.setopt(pycurl.HTTPHEADER, headers_list)
 
@@ -178,27 +183,39 @@ def request(
     buffer = BytesIO()
     c.setopt(pycurl.WRITEDATA, buffer)
 
-    try:
-        c.perform()
-    except pycurl.error as e:
-        errcode = e.args[0]
-        if errcode == pycurl.E_OPERATION_TIMEDOUT:
-            raise CurlError("Connection timed out")
-        elif errcode == pycurl.E_COULDNT_RESOLVE_HOST:
-            raise CurlError("Could not resolve host")
-        elif errcode == pycurl.E_COULDNT_CONNECT:
-            if opensocket_rejected_ips:
-                raise CurlError("Connections to private IP addresses are not allowed")
-            raise CurlError("Connection failed")
-        elif errcode == pycurl.E_TOO_MANY_REDIRECTS:
-            raise CurlError("Too many redirects")
-        elif errcode in (pycurl.E_SSL_CONNECT_ERROR, pycurl.E_PEER_FAILED_VERIFICATION):
-            raise CurlError("TLS handshake failed")
+    with start_span(
+        f"HTTP {method.upper()}",
+        attributes={"http.request.method": method.upper(), "url.full": url},
+        kind="client",
+    ) as span:
+        try:
+            c.perform()
+        except pycurl.error as e:
+            errcode = e.args[0]
+            if errcode == pycurl.E_OPERATION_TIMEDOUT:
+                raise CurlError("Connection timed out")
+            elif errcode == pycurl.E_COULDNT_RESOLVE_HOST:
+                raise CurlError("Could not resolve host")
+            elif errcode == pycurl.E_COULDNT_CONNECT:
+                if opensocket_rejected_ips:
+                    raise CurlError(
+                        "Connections to private IP addresses are not allowed"
+                    )
+                raise CurlError("Connection failed")
+            elif errcode == pycurl.E_TOO_MANY_REDIRECTS:
+                raise CurlError("Too many redirects")
+            elif errcode in (
+                pycurl.E_SSL_CONNECT_ERROR,
+                pycurl.E_PEER_FAILED_VERIFICATION,
+            ):
+                raise CurlError("TLS handshake failed")
 
-        raise CurlError(f"HTTP request failed, code: {errcode}")
+            raise CurlError(f"HTTP request failed, code: {errcode}")
 
-    status = c.getinfo(pycurl.RESPONSE_CODE)
-    c.close()
+        status = c.getinfo(pycurl.RESPONSE_CODE)
+        if span is not None:
+            span.set_attribute("http.response.status_code", status)
+        c.close()
 
     return Response(status, buffer.getvalue())
 

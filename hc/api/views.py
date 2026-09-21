@@ -39,6 +39,7 @@ from hc.api.decorators import ApiRequest, authorize, authorize_read, cors
 from hc.api.forms import FlipsFiltersForm
 from hc.api.models import Channel, Check, Flip, Notification, Ping, prepare_durations
 from hc.lib.badges import check_signature, get_badge_svg, get_badge_url
+from hc.lib.metrics import PROM_AVAILABLE, render_metrics
 from hc.lib.signing import unsign_bounce_id
 from hc.lib.string import is_valid_uuid_string, match_keywords
 from hc.lib.tz import all_timezones, legacy_timezones
@@ -875,6 +876,84 @@ def status(request: HttpRequest) -> HttpResponse:
         c.fetchone()
 
     return HttpResponse("OK")
+
+
+def prometheus_metrics(request: HttpRequest) -> HttpResponse:
+    """Expose Prometheus metrics in the text exposition format."""
+
+    if not PROM_AVAILABLE:
+        return HttpResponse(
+            "prometheus-client is not installed", status=501
+        )
+
+    content, content_type = render_metrics()
+    return HttpResponse(content, content_type=content_type)
+
+
+@never_cache
+def health(request: HttpRequest) -> JsonResponse:
+    """Return a JSON health report for use by Kubernetes probes."""
+
+    checks: dict[str, dict[str, str]] = {}
+    healthy = True
+
+    def record(name: str, ok: bool, detail: str = "") -> None:
+        nonlocal healthy
+        checks[name] = {"status": "ok" if ok else "error"}
+        if detail:
+            checks[name]["detail"] = detail
+        if not ok:
+            healthy = False
+
+    # Database connectivity: run a trivial query
+    try:
+        with connection.cursor() as c:
+            c.execute("SELECT 1")
+            c.fetchone()
+        record("database", True)
+    except Exception as e:
+        record("database", False, f"{e.__class__.__name__}: {e}")
+
+    # S3 object storage: check the bucket exists and is reachable
+    if settings.S3_BUCKET:
+        try:
+            from hc.lib.s3 import client
+
+            record("s3", client().bucket_exists(settings.S3_BUCKET))
+        except Exception as e:
+            record("s3", False, f"{e.__class__.__name__}: {e}")
+    else:
+        checks["s3"] = {"status": "not_configured"}
+
+    # SMTP: connect and send EHLO
+    if settings.EMAIL_HOST:
+        try:
+            import smtplib
+
+            with smtplib.SMTP(
+                settings.EMAIL_HOST, settings.EMAIL_PORT, timeout=5
+            ) as smtp:
+                smtp.ehlo()
+            record("smtp", True)
+        except Exception as e:
+            record("smtp", False, f"{e.__class__.__name__}: {e}")
+    else:
+        checks["smtp"] = {"status": "not_configured"}
+
+    # Redis: send PING
+    if redis_url := getattr(settings, "REDIS_URL", None):
+        try:
+            import redis
+
+            redis.from_url(redis_url, socket_timeout=5).ping()
+            record("redis", True)
+        except Exception as e:
+            record("redis", False, f"{e.__class__.__name__}: {e}")
+    else:
+        checks["redis"] = {"status": "not_configured"}
+
+    doc = {"status": "ok" if healthy else "error", "checks": checks}
+    return JsonResponse(doc, status=200 if healthy else 503)
 
 
 @csrf_exempt

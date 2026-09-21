@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import logging
 import signal
 import time
 from argparse import ArgumentParser
@@ -16,9 +15,12 @@ from django.db import close_old_connections, connection
 from django.utils.timezone import now
 
 from hc.api.models import Check, Flip
+from hc.lib import observability
+from hc.lib.metrics import ALERTS_ERRORS, ALERTS_SEND_DURATION, ALERTS_SENT
 from hc.lib.statsd import statsd
+from hc.lib.tracing import init_tracing, start_span
 
-logger = logging.getLogger("hc")
+logger = observability.get_logger("hc")
 
 
 def notify(flip: Flip) -> str | None:
@@ -31,6 +33,7 @@ def notify(flip: Flip) -> str | None:
 
     # Set or clear dates for followup nags
     check = flip.owner
+    observability.bind_check_id(str(check.code))
     check.project.update_next_nag_dates()
     channels = flip.select_channels()
     if not channels:
@@ -38,15 +41,33 @@ def notify(flip: Flip) -> str | None:
 
     send_start = now()
     logs = [f"{check.code} goes {flip.new_status}"]
-    for ch in channels:
-        notify_start = time.time()
-        error = ch.notify(flip)
-        secs = time.time() - notify_start
-        code8 = str(ch.code)[:8]
-        if error:
-            logs.append(f"  {code8} ({ch.kind}) Error in {secs:.1f}s: {error}")
-        else:
-            logs.append(f"  {code8} ({ch.kind}) OK in {secs:.1f}s")
+    with start_span(
+        "sendalerts.notify",
+        attributes={
+            "check.code": str(check.code),
+            "flip.old_status": flip.old_status,
+            "flip.new_status": flip.new_status,
+        },
+    ):
+        for ch in channels:
+            notify_start = time.time()
+            with start_span(
+                "channel.notify",
+                attributes={
+                    "channel.code": str(ch.code),
+                    "channel.kind": ch.kind,
+                },
+            ):
+                error = ch.notify(flip)
+            secs = time.time() - notify_start
+            code8 = str(ch.code)[:8]
+            if error:
+                ALERTS_ERRORS.labels(kind=ch.kind).inc()
+                logs.append(f"  {code8} ({ch.kind}) Error in {secs:.1f}s: {error}")
+            else:
+                ALERTS_SENT.labels(kind=ch.kind).inc()
+                logs.append(f"  {code8} ({ch.kind}) OK in {secs:.1f}s")
+            ALERTS_SEND_DURATION.labels(kind=ch.kind).observe(secs)
 
     statsd.timing("hc.sendalerts.dwellTime", send_start - flip.created)
     statsd.timing("hc.sendalerts.sendTime", now() - send_start)
@@ -180,6 +201,11 @@ class Command(BaseCommand):
         self.shutdown = True
 
     def handle(self, num_workers: int, pool: bool, **options: Any) -> str:
+        # Management commands do not go through ObservabilityMiddleware,
+        # so set up logging and tracing here:
+        observability.configure_logging()
+        init_tracing()
+
         db = settings.DATABASES["default"]
         if "OPTIONS" in db and "application_name" in db["OPTIONS"]:
             db["OPTIONS"]["application_name"] = "sendalerts"
