@@ -137,6 +137,7 @@ INSTALLED_APPS = (
 
 
 MIDDLEWARE = [
+    "hc.lib.middleware.ObservabilityMiddleware",
     "django.middleware.security.SecurityMiddleware",
     "whitenoise.middleware.WhiteNoiseMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
@@ -331,6 +332,18 @@ S3_SECURE = envbool("S3_SECURE", "True")
 # To enable statsd metric collection, set STATSD_HOST="host:hostport"
 # (example: "localhost:8125")
 STATSD_HOST = os.getenv("STATSD_HOST")
+
+# OpenTelemetry tracing. To enable, set OTEL_ENABLED=True and point
+# OTEL_EXPORTER_OTLP_ENDPOINT at an OTLP collector (HTTP/protobuf).
+OTEL_ENABLED = envbool("OTEL_ENABLED", "False")
+OTEL_SERVICE_NAME = os.getenv("OTEL_SERVICE_NAME", "healthchecks")
+OTEL_EXPORTER_OTLP_ENDPOINT = os.getenv(
+    "OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318/v1/traces"
+)
+
+# Redis is optional. If REDIS_URL is set, the /health/ endpoint
+# includes a Redis connectivity (PING) check.
+REDIS_URL = os.getenv("REDIS_URL")
 
 # Integrations
 

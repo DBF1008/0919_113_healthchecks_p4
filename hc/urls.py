@@ -7,12 +7,15 @@ from django.contrib import admin
 from django.urls import include, path
 
 from hc.accounts import views as accounts_views
+from hc.api import views as api_views
 
 prefix = ""
 if _path := urlparse(settings.SITE_ROOT).path.lstrip("/"):
     prefix = f"{_path}/"
 
 urlpatterns = [
+    path(f"{prefix}metrics", api_views.prometheus_metrics),
+    path(f"{prefix}health/", api_views.health),
     path(f"{prefix}admin/login/", accounts_views.login),
     path(f"{prefix}admin/", admin.site.urls),
     path(prefix, include("hc.accounts.urls")),

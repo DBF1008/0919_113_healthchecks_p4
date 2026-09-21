@@ -1,12 +1,15 @@
 from __future__ import annotations
 
-import logging
+import time
 from io import BytesIO
 from threading import Thread
 from uuid import UUID
 
 from django.conf import settings
+from hc.lib import observability
+from hc.lib.metrics import S3_OPERATION_DURATION, S3_OPERATIONS
 from hc.lib.statsd import statsd
+from hc.lib.tracing import start_span
 
 try:
     from minio import InvalidResponseError, Minio, S3Error
@@ -19,7 +22,7 @@ except ImportError:
     settings.S3_BUCKET = None
 
 _client = None
-logger = logging.getLogger(__name__)
+logger = observability.get_logger(__name__)
 
 
 class GetObjectError(Exception):
@@ -80,41 +83,62 @@ def get_object(code: str, n: int) -> bytes | None:
         return None
 
     statsd.incr("hc.lib.s3.getObject")
-    with statsd.timer("hc.lib.s3.getObjectTime"):
+    op_start = time.perf_counter()
+    with (
+        statsd.timer("hc.lib.s3.getObjectTime"),
+        start_span("s3.get_object", attributes={"s3.key.n": n}, kind="client"),
+    ):
         key = f"{code}/{enc(n)}"
         response = None
         try:
             response = client().get_object(settings.S3_BUCKET, key)
+            S3_OPERATIONS.labels(operation="getObject", status="ok").inc()
             return response.read()
         except (S3Error, InvalidResponseError, HTTPError) as e:
             if isinstance(e, S3Error) and e.code == "NoSuchKey":
                 # It's not an error condition if an object does not exist.
                 # Return None, don't log, don't raise.
+                S3_OPERATIONS.labels(operation="getObject", status="ok").inc()
                 return None
 
+            S3_OPERATIONS.labels(operation="getObject", status="error").inc()
             logger.exception(f"{e.__class__.__name__} in hc.lib.s3.get_object")
             raise GetObjectError() from e
         finally:
             if response:
                 response.close()
                 response.release_conn()
+            S3_OPERATION_DURATION.labels(operation="getObject").observe(
+                time.perf_counter() - op_start
+            )
 
 
 def put_object(code: UUID, n: int, data: bytes) -> None:
     assert settings.S3_BUCKET
     key = "%s/%s" % (code, enc(n))
     retries = 10
-    while True:
+    op_start = time.perf_counter()
+    with start_span("s3.put_object", attributes={"s3.key.n": n}, kind="client"):
         try:
-            client().put_object(settings.S3_BUCKET, key, BytesIO(data), len(data))
-            break
-        except S3Error as e:
-            if e.code == "InternalError" and retries > 0:
-                retries -= 1
-                print(f"InternalError, retrying ({retries=})...")
-                continue
+            while True:
+                try:
+                    client().put_object(
+                        settings.S3_BUCKET, key, BytesIO(data), len(data)
+                    )
+                    S3_OPERATIONS.labels(operation="putObject", status="ok").inc()
+                    break
+                except S3Error as e:
+                    if e.code == "InternalError" and retries > 0:
+                        retries -= 1
+                        print(f"InternalError, retrying ({retries=})...")
+                        continue
 
-            raise e
+                    S3_OPERATIONS.labels(operation="putObject", status="error").inc()
+                    raise e
+        finally:
+            S3_OPERATION_DURATION.labels(operation="putObject").observe(
+                time.perf_counter() - op_start
+            )
 
 
 def _remove_objects(code: UUID, upto_n: int) -> None:
@@ -128,22 +152,35 @@ def _remove_objects(code: UUID, upto_n: int) -> None:
     delete_objs = [DeleteObject(obj.object_name) for obj in q]
     if delete_objs:
         num_objs = len(delete_objs)
+        op_start = time.perf_counter()
         try:
-            with statsd.timer("hc.lib.s3.removeObjectsTime"):
+            with (
+                statsd.timer("hc.lib.s3.removeObjectsTime"),
+                start_span("s3.remove_objects", kind="client"),
+            ):
                 errors = client().remove_objects(settings.S3_BUCKET, delete_objs)
                 for e in errors:
                     statsd.incr("hc.lib.s3.removeObjectsErrors")
+                    S3_OPERATIONS.labels(
+                        operation="removeObjects", status="error"
+                    ).inc()
                     logger.error(
                         "remove_objects error for %s: [%s] %s",
                         start_after,
                         e.code,
                         e.message,
                     )
+                S3_OPERATIONS.labels(operation="removeObjects", status="ok").inc()
         except ReadTimeoutError:
             logger.exception(
                 f"ReadTimeoutError while removing {num_objs} objects for {code}"
             )
             statsd.incr("hc.lib.s3.removeObjectsErrors")
+            S3_OPERATIONS.labels(operation="removeObjects", status="error").inc()
+        finally:
+            S3_OPERATION_DURATION.labels(operation="removeObjects").observe(
+                time.perf_counter() - op_start
+            )
 
 
 def remove_objects(check_code: str, upto_n: int, wait: bool = False) -> None:
